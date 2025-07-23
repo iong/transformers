@@ -5,6 +5,7 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 import optax
+import orbax.checkpoint as ocp
 
 import datasets
 import transformer
@@ -22,6 +23,13 @@ _LEARNING_RATE = flags.DEFINE_float(
 
 _EVAL_PERIOD = flags.DEFINE_integer(
     'eval_period', 5, 'Number of training steps between evaluations.'
+)
+_CHECKPOINT_PERIOD = flags.DEFINE_integer(
+    'checkpoint_period', 5, 'Number of training steps between checkpoints.'
+)
+
+_CHECKPOINT_DIR = flags.DEFINE_string(
+    'checkpoint_dir', '/tmp/checkpoints', 'Directory to save checkpoints.'
 )
 
 def numpy_to_jax(pytree):
@@ -51,11 +59,12 @@ def eval_step(model: transformer.EncoderDecoder, metrics: nnx.MultiMetric, batch
     metrics.update(loss=loss, logits=logits, labels=batch['targets'][:, 1:])
 
 
-def main() -> None:
-     
-
+def main() -> None: 
     train_ds, test_ds = datasets.create_train_and_test()
-     
+
+    ckpt_dir = ocp.test_utils.erase_and_create_empty(_CHECKPOINT_DIR.value)
+    checkpointer = ocp.StandardCheckpointer()
+
     rngs = nnx.Rngs(0)
     encdec = transformer.EncoderDecoder(
         transformer.TransformerConfig(
@@ -84,6 +93,10 @@ def main() -> None:
     for step, batch in enumerate(train_ds.take(_NUM_TRAINS_STEPS.value).as_numpy_iterator()):
         batch = numpy_to_jax(batch)
         train_step(encdec, optimizer, metrics, numpy_to_jax(batch))
+
+        if step % _CHECKPOINT_PERIOD.value == 0:
+            _, state = nnx.split(encdec)
+            checkpointer.save(ckpt_dir / f"state_{step:06d}", state)
 
         if step > 0 and step % _EVAL_PERIOD.value == 0:
             metrics_history['step'].append(step)
