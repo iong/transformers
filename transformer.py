@@ -4,8 +4,6 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 
-_MAX_WAVELENGTH = 10000
-
 @dataclasses.dataclass
 class TransformerConfig:
     d: int = 512
@@ -13,7 +11,7 @@ class TransformerConfig:
     num_layers: int = 6
     dff: int = 2048
     dropout_rate: float = 0.1
-    rope_max_wavelength: int = _MAX_WAVELENGTH
+    rope_max_wavelength: int = 10000
     rope_scale_factor: float = 1.0
     vocab_size: int = 0
 
@@ -21,7 +19,7 @@ class TransformerConfig:
         """Calculate the key dimension."""
         return self.d // self.num_heads
 
-def Rope(
+def RoPE(
     inputs: jax.Array,  # [B, L, H, D]
     positions: jax.Array,  # [B, L]
     max_wavelength: int,
@@ -83,8 +81,8 @@ class MultiHeadAttention(nnx.Module):
 class EncoderLayer(nnx.Module):
     def __init__(self, config: TransformerConfig, rngs: nnx.Rngs):
         self.mha = MultiHeadAttention(config.d, config.num_heads, config.k(), config.k(), config.rope_max_wavelength, config.rope_scale_factor, rngs)
-        self.linear1 = nnx.Linear(config.d, config.dff, rngs)
-        self.linear2 = nnx.Linear(config.dff, config.d, rngs)
+        self.linear1 = nnx.Linear(config.d, config.dff, rngs=rngs)
+        self.linear2 = nnx.Linear(config.dff, config.d, rngs=rngs)
         self.layernorm1 = nnx.LayerNorm(config.d, rngs=rngs)
         self.layernorm2 = nnx.LayerNorm(config.d, rngs=rngs)
 
@@ -101,8 +99,8 @@ class DecoderLayer(nnx.Module):
     def __init__(self, config: TransformerConfig, rngs: nnx.Rngs):
         self.mha1 = MultiHeadAttention(config.d, config.num_heads, config.k(), config.k(), config.rope_max_wavelength, config.rope_scale_factor, rngs)
         self.mha2 = MultiHeadAttention(config.d, config.num_heads, config.k(), config.k(), config.rope_max_wavelength, config.rope_scale_factor, rngs)
-        self.linear1 = nnx.Linear(config.d, config.dff, rngs)
-        self.linear2 = nnx.Linear(config.dff, config.d, rngs)
+        self.linear1 = nnx.Linear(config.d, config.dff, rngs=rngs)
+        self.linear2 = nnx.Linear(config.dff, config.d, rngs=rngs)
         self.layernorm1 = nnx.LayerNorm(config.d, rngs=rngs)
         self.layernorm2 = nnx.LayerNorm(config.d, rngs=rngs)
         self.layernorm3 = nnx.LayerNorm(config.d, rngs=rngs)
@@ -149,12 +147,13 @@ class Decoder(nnx.Module):
         x, _, _, _ = _apply_decoder_layer(self.layers, (x, x_positions, encoder_output, encoder_positions))
         return x
 
-class Transformer(nnx.Module):
+class EncoderDecoder(nnx.Module):
     def __init__(self, config: TransformerConfig, rngs: nnx.Rngs):
-        self.embeddings = nnx.Embed(config.vocab_size, config.d, rngs)
+        self.embeddings = nnx.Embed(num_embeddings=config.vocab_size,
+                                    features=config.d, rngs=rngs)
         self.encoder = Encoder(config, rngs)
         self.decoder = Decoder(config, rngs)
-        self.output_layer = nnx.Linear(config.d, config.vocab_size, rngs)
+        self.output_layer = nnx.Linear(config.d, config.vocab_size, rngs=rngs)
 
     def __call__(self, inputs: jax.Array,
                  targets: jax.Array) -> jax.Array:
