@@ -4,48 +4,58 @@ from absl import app
 from flax import nnx
 import jax
 import jax.numpy as jnp
-import sentencepiece as spm
+import optax
 
-import functools
-import tensorflow as tf
-import tensorflow_datasets as tfds
-
+import datasets
 import transformer
 
-_TOKENIZER = flags.DEFINE_string('tokenizer', '',
-                                 'Path to the SentencePiece tokenizer model.')
+_NUM_TRAINS_STEPS = flags.DEFINE_integer(
+    'num_train_steps', 10000, 'Number of training steps to run.'
+)
+_NUM_EVAL_STEPS = flags.DEFINE_integer(
+    'num_eval_steps', 100, 'Number of evaluation steps to run.'
+)
 
-def pad_and_trim_sequence(tokens, bos_id, length):
-    tokens = tf.concat([[bos_id], tokens], axis=0)[:length]
-    paddings = tf.pad(length - tf.shape(tokens), [[1, 0]], constant_values=0)
-    tokens  = tf.pad(tokens, paddings[tf.newaxis, :], constant_values=0)
-    return tokens
+_LEARNING_RATE = flags.DEFINE_float(
+    'learning_rate', 1e-3, 'Initial learning rate for the optimizer.'
+)
 
-def pad_and_trim(example, input_length, target_length, bos_id=None):
-    example['inputs'] = pad_and_trim_sequence(
-        example['inputs'], bos_id, input_length)
-    example['targets'] = pad_and_trim_sequence(
-        example['targets'], bos_id, target_length)
-    return example
+_EVAL_PERIOD = flags.DEFINE_integer(
+    'eval_period', 5, 'Number of training steps between evaluations.'
+)
 
-def tokenize(example, input_key='inputs', target_key='targets', tokenizer=None):
-    return {
-        'inputs': tokenizer.encode_tf(example[input_key]),
-        'targets': tokenizer.encode_tf(example[target_key]),
-        'inputs_pretokenized': example[input_key],
-        'targets_pretokenized': example[target_key]
-    }
+def numpy_to_jax(pytree):
+    """Convert a PyTree of NumPy arrays to JAX arrays."""
+    return jax.tree.map(lambda x: jnp.array(x), pytree)
+
+def loss_fn(model: transformer.EncoderDecoder, batch):
+    logits = model(batch['inputs'], batch['targets'][:, :-1])
+    loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits=logits, labels=batch['targets'][:, 1:]
+    ).mean()
+    return loss, logits
+
+
+@nnx.jit
+def train_step(model: transformer.EncoderDecoder, optimizer: nnx.Optimizer,
+               metrics: nnx.MultiMetric, batch):
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True, argnums=0)
+    (loss, logits), grads = grad_fn(model, batch)
+    metrics.update(loss=loss, logits=logits, labels=batch['targets'][:, 1:])
+    optimizer.update(grads)
+
+
+@nnx.jit
+def eval_step(model: transformer.EncoderDecoder, metrics: nnx.MultiMetric, batch):
+    loss, logits = loss_fn(model, batch)
+    metrics.update(loss=loss, logits=logits, labels=batch['targets'][:, 1:])
+
 
 def main() -> None:
-     builder = tfds.builder("wmt19_translate/de-en")
-     if not builder.is_prepared():
-         builder.download_and_prepare()
-    
-    train_ds = (
-        builder
-        .as_dataset(split='train', shuffle_files=True)
-        .shuffle(1024)
-        )
+     
+
+    train_ds, test_ds = datasets.create_train_and_test()
+     
     rngs = nnx.Rngs(0)
     encdec = transformer.EncoderDecoder(
         transformer.TransformerConfig(
@@ -53,10 +63,41 @@ def main() -> None:
         ),
         rngs=rngs
     )
+    optimizer = nnx.Optimizer(encdec, optax.adamw(_LEARNING_RATE.value))
+    metrics = nnx.MultiMetric(
+        accuracy=nnx.metrics.Accuracy(),
+        loss=nnx.metrics.Average('loss')
+    )
+    eval_metrics = nnx.MultiMetric(
+        accuracy=nnx.metrics.Accuracy(),
+        loss=nnx.metrics.Average('loss')
+    )
 
-    key, subk1, subk2 = jax.random.split(rngs(), 3)
-    print(encdec(jax.random.randint(subk1, (2, 10), 0, 10000),
-        jax.random.randint(subk1, (2, 10), 0, 10000)))
+    metrics_history = {
+        'step': [],
+        'train_loss': [],
+        'train_accuracy': [],
+        'test_loss': [],
+        'test_accuracy': []
+    }
+
+    for step, batch in enumerate(train_ds.take(_NUM_TRAINS_STEPS.value).as_numpy_iterator()):
+        batch = numpy_to_jax(batch)
+        train_step(encdec, optimizer, metrics, numpy_to_jax(batch))
+
+        if step > 0 and step % _EVAL_PERIOD.value == 0:
+            metrics_history['step'].append(step)
+            for metric_name, metric_value in metrics.compute().items():
+                metrics_history[f'train_{metric_name}'].append(metric_value)
+            metrics.reset()
+   
+            for eval_batch in test_ds.take(_NUM_EVAL_STEPS.value):
+                eval_step(encdec, eval_metrics, numpy_to_jax(eval_batch))
+            for metric_name, metric_value in eval_metrics.compute().items():
+                metrics_history[f'test_{metric_name}'].append(metric_value)
+            eval_metrics.reset()
+
+            print(f'Step {step}, Train Metrics: {metrics}, Eval Metrics: {eval_metrics}')
 
 if __name__ == '__main__':
     app.run(main)
